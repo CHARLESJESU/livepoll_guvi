@@ -9,9 +9,9 @@ services:
   backend:
     build: ./backend
     environment:
-      MONGO_URL: mongodb://mongo:27017
-      REDIS_URL: redis://redis:6379
-      FRONTEND_URL: http://localhost:5173
+      MONGO_URL: ${MONGO_URL:-mongodb://mongo:27017}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
       SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET before starting}
     ports: ["8080:8080"]
     depends_on: [mongo, redis]
