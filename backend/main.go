@@ -17,11 +17,11 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
-	"golang.org/x/crypto/bcrypt"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type User struct {
@@ -90,8 +90,15 @@ func main() {
 		panic("SESSION_SECRET must be set to a non-default value")
 	}
 	app := &App{users: db.Collection("users"), polls: db.Collection("polls"), votes: db.Collection("votes"), redis: redisClient, secret: []byte(secret)}
-	_, _ = app.users.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true)})
-	_, _ = app.votes.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "pollId", Value: 1}, {Key: "voter", Value: 1}}, Options: options.Index().SetUnique(true)})
+	if _, err := app.users.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true)}); err != nil {
+		panic("could not create the users email index")
+	}
+	if _, err := app.polls.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "ownerId", Value: 1}, {Key: "createdAt", Value: -1}}}); err != nil {
+		panic("could not create the polls owner index")
+	}
+	if _, err := app.votes.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "pollId", Value: 1}, {Key: "voter", Value: 1}}, Options: options.Index().SetUnique(true)}); err != nil {
+		panic("could not create the votes uniqueness index")
+	}
 
 	router := gin.Default()
 	router.Use(cors.New(cors.Config{AllowOrigins: []string{env("FRONTEND_URL", "http://localhost:5173")}, AllowHeaders: []string{"Origin", "Content-Type", "Authorization"}, AllowMethods: []string{"GET", "POST", "OPTIONS"}}))
@@ -171,16 +178,23 @@ func (a *App) requireAuth(c *gin.Context) {
 
 func (a *App) createPoll(c *gin.Context) {
 	var req createPollRequest
-	if !decodeJSON(c, &req) || len(strings.TrimSpace(req.Question)) < 5 || len(req.Options) < 2 || len(req.Options) > 6 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "question needs 5+ characters and there must be 2-6 options"})
+	if !decodeJSON(c, &req) || len(strings.TrimSpace(req.Question)) < 5 || len(strings.TrimSpace(req.Question)) > 200 || len(req.Options) < 2 || len(req.Options) > 6 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "question needs 5-200 characters and there must be 2-6 options"})
 		return
 	}
+	seen := make(map[string]struct{}, len(req.Options))
 	for i := range req.Options {
 		req.Options[i] = strings.TrimSpace(req.Options[i])
 		if len(req.Options[i]) < 1 || len(req.Options[i]) > 80 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "options must be 1-80 characters"})
 			return
 		}
+		key := strings.ToLower(req.Options[i])
+		if _, exists := seen[key]; exists {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "poll options must be unique"})
+			return
+		}
+		seen[key] = struct{}{}
 	}
 	poll := Poll{ID: primitive.NewObjectID(), OwnerID: c.MustGet("userID").(primitive.ObjectID), Question: strings.TrimSpace(req.Question), Options: req.Options, CreatedAt: time.Now().UTC()}
 	if _, err := a.polls.InsertOne(c, poll); err != nil {
@@ -213,7 +227,11 @@ func (a *App) vote(c *gin.Context) {
 		return
 	}
 	var req voteRequest
-	if !decodeJSON(c, &req) || req.Option < 0 || req.Option >= len(poll.Options) || len(req.Voter) < 16 || len(req.Voter) > 100 {
+	if !decodeJSON(c, &req) {
+		return
+	}
+	req.Voter = strings.TrimSpace(req.Voter)
+	if req.Option < 0 || req.Option >= len(poll.Options) || len(req.Voter) < 16 || len(req.Voter) > 100 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid vote"})
 		return
 	}
@@ -227,8 +245,27 @@ func (a *App) vote(c *gin.Context) {
 		return
 	}
 	key := fmt.Sprintf("poll:%s:counts", poll.ID.Hex())
-	values, _ := a.redis.HIncrBy(c, key, fmt.Sprint(req.Option), 1).Result()
-	counts, _ := a.getCounts(c, poll.ID, len(poll.Options))
+	values, err := a.redis.HIncrBy(c, key, fmt.Sprint(req.Option), 1).Result()
+	if err != nil {
+		if rebuildErr := a.rebuildCounts(c, poll.ID, len(poll.Options)); rebuildErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not update live results"})
+			return
+		}
+		counts, countErr := a.getCounts(c, poll.ID, len(poll.Options))
+		if countErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load results"})
+			return
+		}
+		payload, _ := json.Marshal(counts)
+		_ = a.redis.Publish(c, "poll:"+poll.ID.Hex(), payload).Err()
+		c.JSON(http.StatusCreated, gin.H{"counts": counts})
+		return
+	}
+	counts, err := a.getCounts(c, poll.ID, len(poll.Options))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load results"})
+		return
+	}
 	payload, _ := json.Marshal(counts)
 	_ = a.redis.Publish(c, "poll:"+poll.ID.Hex(), payload).Err()
 	c.JSON(http.StatusCreated, gin.H{"counts": counts, "updated": values})
@@ -341,7 +378,7 @@ func (a *App) token(id primitive.ObjectID) string {
 	raw := id.Hex() + "." + fmt.Sprint(time.Now().Add(24*time.Hour).Unix())
 	mac := hmac.New(sha256.New, a.secret)
 	mac.Write([]byte(raw))
-	return base64.RawURLEncoding.EncodeToString([]byte(raw+"."+base64.RawURLEncoding.EncodeToString(mac.Sum(nil))))
+	return base64.RawURLEncoding.EncodeToString([]byte(raw + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))))
 }
 
 func (a *App) parseToken(header string) (primitive.ObjectID, bool) {
@@ -379,7 +416,10 @@ func decodeJSON(c *gin.Context, target interface{}) bool {
 }
 
 func validCredentials(req authRequest) bool {
-	return strings.Contains(req.Email, "@") && len(req.Password) >= 8 && len(req.Password) <= 72
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	return len(email) <= 254 && strings.Contains(email, "@") &&
+		strings.Contains(strings.SplitN(email, "@", 2)[1], ".") &&
+		len(req.Password) >= 8 && len(req.Password) <= 72
 }
 
 func writeEvent(c *gin.Context, payload Counts) {
@@ -394,4 +434,3 @@ func env(key, fallback string) string {
 	}
 	return fallback
 }
-

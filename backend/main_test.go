@@ -19,6 +19,7 @@ func TestValidCredentials(t *testing.T) {
 	}{
 		{"valid credentials", "user@example.com", "password123", true},
 		{"missing at symbol", "userexample.com", "password123", false},
+		{"missing domain dot", "user@localhost", "password123", false},
 		{"short password", "user@example.com", "pass", false},
 		{"password too long", "user@example.com", strings.Repeat("a", 73), false},
 		{"exact min password length", "user@example.com", "12345678", true},
